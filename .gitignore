@@ -1,0 +1,4 @@
+.build/
+kobun
+*.dSYM/
+*.o
