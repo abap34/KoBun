@@ -26,10 +26,51 @@ void print_jsvalue(FILE *out, JSContextRef context, JSValueRef value) {
     char *cstr = malloc(size);
 
     JSStringGetUTF8CString(str, cstr, size);
-    fprintf(out, "%s\n", cstr);
+    fprintf(out, "%s", cstr);
 
     free(cstr);
     JSStringRelease(str);
+}
+
+void println_jsvalue(FILE *out, JSContextRef context, JSValueRef value) {
+    print_jsvalue(out, context, value);
+    fprintf(out, "\n");
+}
+
+JSValueRef console_log_callback(JSContextRef ctx, JSObjectRef func,
+                                JSObjectRef thisObject, size_t argumentCount,
+                                const JSValueRef arguments[],
+                                JSValueRef *exception) {
+    (void)func;
+    (void)thisObject;
+    (void)exception;
+
+    for (size_t i = 0; i < argumentCount; i++) {
+        print_jsvalue(stdout, ctx, arguments[i]);
+        if (i < argumentCount - 1)
+            fprintf(stdout, " ");
+    }
+
+    fprintf(stdout, "\n");
+    return JSValueMakeUndefined(ctx);
+}
+
+void setup_ctx(JSGlobalContextRef ctx) {
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+
+    JSObjectRef console = JSObjectMake(ctx, NULL, NULL);
+    JSStringRef console_name = JSStringCreateWithUTF8CString("console");
+    JSObjectSetProperty(ctx, global, console_name, console,
+                        kJSPropertyAttributeNone, NULL);
+
+    JSStringRef log_name = JSStringCreateWithUTF8CString("log");
+    JSObjectRef log_func =
+        JSObjectMakeFunctionWithCallback(ctx, log_name, console_log_callback);
+    JSObjectSetProperty(ctx, console, log_name, log_func,
+                        kJSPropertyAttributeNone, NULL);
+
+    JSStringRelease(log_name);
+    JSStringRelease(console_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -45,15 +86,16 @@ int main(int argc, char *argv[]) {
     }
 
     JSGlobalContextRef context = JSGlobalContextCreate(NULL);
+
+    setup_ctx(context);
+
     JSStringRef script = JSStringCreateWithUTF8CString(src);
     JSValueRef exception = NULL;
-    JSValueRef result = JSEvaluateScript(context, script, NULL, NULL, 1, &exception);
+    JSEvaluateScript(context, script, NULL, NULL, 1, &exception);
 
     if (exception) {
         fprintf(stderr, "Error: ");
-        print_jsvalue(stderr, context, exception);
-    } else {
-        print_jsvalue(stdout, context, result);
+        println_jsvalue(stderr, context, exception);
     }
 
     JSStringRelease(script);
