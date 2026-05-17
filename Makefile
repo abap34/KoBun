@@ -5,7 +5,7 @@ JSC := -framework JavaScriptCore
 .PHONY: build run clean
 
 build:
-	$(CC) $(CFLAGS) -o kobun src/*.c $(JSC)
+	$(CC) $(CFLAGS) -o kobun main.c $(JSC)
 
 clean:
 	rm -rf .build kobun

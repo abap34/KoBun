@@ -1,2 +1,1 @@
-const x = 1 + 2;
-x;
+console.log("hello", 123, true);
