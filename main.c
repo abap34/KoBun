@@ -118,35 +118,71 @@ Runtime *get_rt(JSContextRef ctx) {
     return (Runtime *)JSObjectGetPrivate(global);
 }
 
-// Insert a task into the task queue. Return the generated task id.
-// Important note: The head of the queue is the task with the earliest deadline.
-int add_task(Runtime *rt, JSObjectRef callback, int64_t deadline_ms) {
+// ==== Task queue ====
+
+bool tq_is_empty(Runtime *rt) { return rt->task_queue_head == NULL; }
+
+int64_t tq_next_deadline(Runtime *rt) {
+    if (rt->task_queue_head) {
+        return rt->task_queue_head->deadline_ms;
+    }
+    return -1;
+}
+
+Task *create_task(Runtime *rt, JSObjectRef callback, int64_t deadline_ms) {
     Task *task = malloc(sizeof(Task));
     task->id = gen_task_id(rt);
     task->callback = callback;
     task->deadline_ms = deadline_ms;
+    task->next = NULL;
     JSValueProtect(rt->ctx, callback);
+    return task;
+}
 
-    if (rt->task_queue_head == NULL) {
+// Important note: The head of the queue is the task with the earliest deadline.
+void tq_push(Runtime *rt, Task *task) {
+    if (tq_is_empty(rt)) {
         rt->task_queue_head = task;
         rt->task_queue_tail = task;
-        task->next = NULL;
-    } else if (deadline_ms < rt->task_queue_head->deadline_ms) {
-        task->next = rt->task_queue_head;
-        rt->task_queue_head = task;
-    } else {
-        Task *prev = rt->task_queue_head;
-        while (prev->next && prev->next->deadline_ms <= deadline_ms) {
-            prev = prev->next;
-        }
-        task->next = prev->next;
-        prev->next = task;
-
-        if (prev == rt->task_queue_tail) {
-            rt->task_queue_tail = task;
-        }
+        return;
     }
 
+    if (task->deadline_ms < tq_next_deadline(rt)) {
+        task->next = rt->task_queue_head;
+        rt->task_queue_head = task;
+        return;
+    }
+
+    Task *prev = rt->task_queue_head;
+    while (prev->next && prev->next->deadline_ms <= task->deadline_ms) {
+        prev = prev->next;
+    }
+
+    task->next = prev->next;
+    prev->next = task;
+
+    if (task->next == NULL) {
+        rt->task_queue_tail = task;
+    }
+}
+
+Task *tq_pop(Runtime *rt) {
+    Task *task = rt->task_queue_head;
+    if (task == NULL) return NULL;
+
+    rt->task_queue_head = task->next;
+    if (rt->task_queue_head == NULL) {
+        rt->task_queue_tail = NULL;
+    }
+
+    task->next = NULL;
+    return task;
+}
+
+// Insert a task into the task queue. Return the generated task id.
+int add_task(Runtime *rt, JSObjectRef callback, int64_t deadline_ms) {
+    Task *task = create_task(rt, callback, deadline_ms);
+    tq_push(rt, task);
     return task->id;
 }
 
@@ -156,26 +192,18 @@ void destroy_task(Runtime *rt, Task *task) {
 }
 
 void destroy_pending_tasks(Runtime *rt) {
-    while (rt->task_queue_head) {
-        Task *task = rt->task_queue_head;
-        rt->task_queue_head = task->next;
+    while (!tq_is_empty(rt)) {
+        Task *task = tq_pop(rt);
         destroy_task(rt, task);
     }
-
-    rt->task_queue_tail = NULL;
-}
-
-bool is_empty(Runtime *rt) { return rt->task_queue_head == NULL; }
-
-int64_t next_deadline(Runtime *rt) {
-    if (rt->task_queue_head) {
-        return rt->task_queue_head->deadline_ms;
-    }
-    return -1;
 }
 
 bool deadline_overdue(int64_t deadline_ms) {
     return current_time_ms() >= deadline_ms;
+}
+
+bool tq_has_due_task(Runtime *rt) {
+    return !tq_is_empty(rt) && deadline_overdue(tq_next_deadline(rt));
 }
 
 // Execute a task by calling its callback function.
@@ -199,13 +227,8 @@ bool execute(Runtime *rt, Task *task) {
 int may_consume_task(Runtime *rt) {
     int execute_count = 0;
 
-    while (rt->task_queue_head &&
-           deadline_overdue(rt->task_queue_head->deadline_ms)) {
-        Task *task = rt->task_queue_head;
-        rt->task_queue_head = task->next;
-        if (rt->task_queue_head == NULL) {
-            rt->task_queue_tail = NULL;
-        }
+    while (tq_has_due_task(rt)) {
+        Task *task = tq_pop(rt);
 
         if (!execute(rt, task)) {
             destroy_task(rt, task);
@@ -317,9 +340,9 @@ void setup_rt(Runtime *rt) {
 }
 
 bool event_loop(Runtime *rt) {
-    while (!is_empty(rt)) {
+    while (!tq_is_empty(rt)) {
         if (may_consume_task(rt) < 0) return false;
-        int64_t next = next_deadline(rt);
+        int64_t next = tq_next_deadline(rt);
         if (next >= 0) {
             sleep_until(next);
         }
