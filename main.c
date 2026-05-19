@@ -82,6 +82,29 @@ void print_jsvalue(JSContextRef ctx, JSValueRef value) {
     JSStringRelease(str);
 }
 
+JSValueRef make_js_string(JSContextRef ctx, const char *value) {
+    JSStringRef str = JSStringCreateWithUTF8CString(value);
+    JSValueRef js_value = JSValueMakeString(ctx, str);
+    JSStringRelease(str);
+    return js_value;
+}
+
+JSValueRef get_property(JSContextRef ctx, JSObjectRef object,
+                        const char *name) {
+    JSStringRef key = JSStringCreateWithUTF8CString(name);
+    JSValueRef value = JSObjectGetProperty(ctx, object, key, NULL);
+    JSStringRelease(key);
+    return value;
+}
+
+void set_property(JSContextRef ctx, JSObjectRef object, const char *name,
+                  JSValueRef value) {
+    JSStringRef key = JSStringCreateWithUTF8CString(name);
+    JSObjectSetProperty(ctx, object, key, value, kJSPropertyAttributeNone,
+                        NULL);
+    JSStringRelease(key);
+}
+
 void println_jsvalue(JSContextRef ctx, JSValueRef value) {
     print_jsvalue(ctx, value);
     printf("\n");
@@ -261,8 +284,6 @@ JSObjectRef response_constructor(JSContextRef ctx, JSObjectRef constructor,
                                  size_t argumentCount,
                                  const JSValueRef arguments[],
                                  JSValueRef *exception) {
-    (void)argumentCount;
-    (void)arguments;
     (void)exception;
 
     Runtime *rt = get_rt(ctx);
@@ -273,6 +294,20 @@ JSObjectRef response_constructor(JSContextRef ctx, JSObjectRef constructor,
         JSObjectGetProperty(ctx, constructor, prototype_name, NULL);
     JSObjectSetPrototype(ctx, response, prototype);
     JSStringRelease(prototype_name);
+
+    JSValueRef body =
+        argumentCount > 0 ? arguments[0] : make_js_string(ctx, "");
+    set_property(ctx, response, "body", body);
+
+    int status = 200;
+    if (argumentCount > 1 && JSValueIsObject(ctx, arguments[1])) {
+        JSObjectRef init = JSValueToObject(ctx, arguments[1], NULL);
+        JSValueRef status_value = get_property(ctx, init, "status");
+        if (JSValueIsNumber(ctx, status_value)) {
+            status = (int)JSValueToNumber(ctx, status_value, NULL);
+        }
+    }
+    set_property(ctx, response, "status", JSValueMakeNumber(ctx, status));
 
     return response;
 }
