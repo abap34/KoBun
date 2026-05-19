@@ -25,6 +25,11 @@ typedef struct Task {
     struct Task *next;
 } Task;
 
+// Classes that we define in C and expose to JavaScript
+typedef struct HostClasses {
+    JSClassRef response;
+} HostClasses;
+
 typedef struct Runtime {
     // JavaScriptCore context
     JSGlobalContextRef ctx;
@@ -35,6 +40,9 @@ typedef struct Runtime {
 
     // counter for generating unique task id
     int _task_id_counter;
+
+    // host classes
+    HostClasses host_classes;
 } Runtime;
 
 int gen_task_id(Runtime *rt) {
@@ -98,14 +106,19 @@ void sleep_until(int64_t deadline_ms) {
 // ==== Runtime management ====
 
 void init_rt(Runtime *rt) {
+    rt->ctx = NULL;
+    rt->host_classes.response = NULL;
+    rt->task_queue_head = NULL;
+    rt->task_queue_tail = NULL;
+    rt->_task_id_counter = 0;
+}
+
+void create_context(Runtime *rt) {
     JSClassDefinition kb_class = kJSClassDefinitionEmpty;
     kb_class.className = "KoBunRuntime";
     JSClassRef global_class = JSClassCreate(&kb_class);
     rt->ctx = JSGlobalContextCreate(global_class);
     JSClassRelease(global_class);
-    rt->task_queue_head = NULL;
-    rt->task_queue_tail = NULL;
-    rt->_task_id_counter = 0;
 }
 
 void attach_runtime(Runtime *rt) {
@@ -242,7 +255,68 @@ int may_consume_task(Runtime *rt) {
     return execute_count;
 }
 
-// ==== Builtin functions ====
+// ==== Builtin classes/functions ====
+
+JSObjectRef response_constructor(JSContextRef ctx, JSObjectRef constructor,
+                                 size_t argumentCount,
+                                 const JSValueRef arguments[],
+                                 JSValueRef *exception) {
+    (void)argumentCount;
+    (void)arguments;
+    (void)exception;
+
+    Runtime *rt = get_rt(ctx);
+    JSObjectRef response = JSObjectMake(ctx, rt->host_classes.response, NULL);
+
+    JSStringRef prototype_name = JSStringCreateWithUTF8CString("prototype");
+    JSValueRef prototype =
+        JSObjectGetProperty(ctx, constructor, prototype_name, NULL);
+    JSObjectSetPrototype(ctx, response, prototype);
+    JSStringRelease(prototype_name);
+
+    return response;
+}
+
+typedef struct HostClassSpec {
+    const char *name;
+    JSClassRef *class_ref;
+    JSObjectCallAsConstructorCallback constructor;
+} HostClassSpec;
+
+void install_classes(Runtime *rt) {
+    HostClassSpec classes[] = {
+        {"Response", &rt->host_classes.response, response_constructor},
+    };
+
+    size_t num_classes = sizeof(classes) / sizeof(classes[0]);
+    for (size_t i = 0; i < num_classes; i++) {
+        JSClassDefinition def = kJSClassDefinitionEmpty;
+        def.className = classes[i].name;
+        *classes[i].class_ref = JSClassCreate(&def);
+
+        JSObjectRef global = JSContextGetGlobalObject(rt->ctx);
+        JSStringRef js_name = JSStringCreateWithUTF8CString(classes[i].name);
+        JSObjectRef constructor = JSObjectMakeConstructor(
+            rt->ctx, *classes[i].class_ref, classes[i].constructor);
+        JSObjectSetProperty(rt->ctx, global, js_name, constructor,
+                            kJSPropertyAttributeNone, NULL);
+        JSStringRelease(js_name);
+    }
+}
+
+void destroy_classes(Runtime *rt) {
+    JSClassRef *classes[] = {
+        &rt->host_classes.response,
+    };
+
+    size_t num_classes = sizeof(classes) / sizeof(classes[0]);
+    for (size_t i = 0; i < num_classes; i++) {
+        if (*classes[i]) {
+            JSClassRelease(*classes[i]);
+            *classes[i] = NULL;
+        }
+    }
+}
 
 JSValueRef console_log_callback(JSContextRef ctx, JSObjectRef func,
                                 JSObjectRef thisObject, size_t argumentCount,
@@ -335,8 +409,21 @@ void install_builtins(Runtime *rt) {
 
 void setup_rt(Runtime *rt) {
     init_rt(rt);
-    install_builtins(rt);
+    create_context(rt);
     attach_runtime(rt);
+    install_classes(rt);
+    install_builtins(rt);
+}
+
+void destroy_rt(Runtime *rt) {
+    destroy_pending_tasks(rt);
+
+    if (rt->ctx) {
+        JSGlobalContextRelease(rt->ctx);
+        rt->ctx = NULL;
+    }
+
+    destroy_classes(rt);
 }
 
 bool event_loop(Runtime *rt) {
@@ -380,9 +467,8 @@ int main(int argc, char *argv[]) {
         exit_code = 1;
     }
 
-    destroy_pending_tasks(&rt);
     JSStringRelease(script);
-    JSGlobalContextRelease(rt.ctx);
+    destroy_rt(&rt);
     free(src);
     return exit_code;
 }
