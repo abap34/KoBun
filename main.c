@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 // Atomic operation for event loop.
@@ -70,16 +71,28 @@ char *read_file(char *path) {
     return content;
 }
 
-void print_jsvalue(JSContextRef ctx, JSValueRef value) {
+char *jsvalue_to_cstring(JSContextRef ctx, JSValueRef value) {
     JSStringRef str = JSValueToStringCopy(ctx, value, NULL);
+    if (str == NULL) return NULL;
+
     size_t size = JSStringGetMaximumUTF8CStringSize(str);
     char *cstr = malloc(size);
+    if (cstr == NULL) {
+        JSStringRelease(str);
+        return NULL;
+    }
 
     JSStringGetUTF8CString(str, cstr, size);
-    printf("%s", cstr);
-
-    free(cstr);
     JSStringRelease(str);
+    return cstr;
+}
+
+void print_jsvalue(JSContextRef ctx, JSValueRef value) {
+    char *cstr = jsvalue_to_cstring(ctx, value);
+    if (cstr == NULL) return;
+
+    printf("%s", cstr);
+    free(cstr);
 }
 
 JSValueRef make_js_string(JSContextRef ctx, const char *value) {
@@ -309,7 +322,76 @@ JSObjectRef response_constructor(JSContextRef ctx, JSObjectRef constructor,
     }
     set_property(ctx, response, "status", JSValueMakeNumber(ctx, status));
 
+    JSObjectRef headers = JSObjectMake(ctx, NULL, NULL);
+
+    if (argumentCount > 1 && JSValueIsObject(ctx, arguments[1])) {
+        JSObjectRef init = JSValueToObject(ctx, arguments[1], NULL);
+        JSValueRef headers_value = get_property(ctx, init, "headers");
+
+        if (JSValueIsObject(ctx, headers_value)) {
+            headers = JSValueToObject(ctx, headers_value, NULL);
+        }
+    }
+
+    set_property(ctx, response, "headers", headers);
+
     return response;
+}
+
+bool is_response(Runtime *rt, JSContextRef ctx, JSValueRef value) {
+    return JSValueIsObjectOfClass(ctx, value, rt->host_classes.response);
+}
+
+int read_response_status(JSContextRef ctx, JSObjectRef response) {
+    JSValueRef value = get_property(ctx, response, "status");
+    if (!JSValueIsNumber(ctx, value)) return 200;
+    return (int)JSValueToNumber(ctx, value, NULL);
+}
+
+char *read_response_body(JSContextRef ctx, JSObjectRef response) {
+    JSValueRef value = get_property(ctx, response, "body");
+    return jsvalue_to_cstring(ctx, value);
+}
+
+const char *response_reason_phrase(int status) {
+    switch (status) {
+    case 200:
+        return "OK";
+    case 404:
+        return "Not Found";
+    default:
+        return "OK";
+    }
+}
+
+char *serialize_response(JSContextRef ctx, JSObjectRef response) {
+    char *body = read_response_body(ctx, response);
+    if (body == NULL) return NULL;
+
+    int status = read_response_status(ctx, response);
+    const char *reason = response_reason_phrase(status);
+    size_t body_len = strlen(body);
+
+    int size =
+        snprintf(NULL, 0, "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n\r\n%s",
+                 status, reason, body_len, body);
+    if (size < 0) {
+        free(body);
+        return NULL;
+    }
+
+    char *serialized = malloc((size_t)size + 1);
+    if (serialized == NULL) {
+        free(body);
+        return NULL;
+    }
+
+    snprintf(serialized, (size_t)size + 1,
+             "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n\r\n%s", status, reason,
+             body_len, body);
+
+    free(body);
+    return serialized;
 }
 
 typedef struct HostClassSpec {
