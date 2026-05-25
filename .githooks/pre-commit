@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+
+xcrun clang-format --dry-run --Werror main.c
