@@ -118,6 +118,58 @@ void set_property(JSContextRef ctx, JSObjectRef object, const char *name,
     JSStringRelease(key);
 }
 
+char *copy_span(const char *start, size_t len) {
+    char *copy = malloc(len + 1);
+    if (copy == NULL) return NULL;
+
+    memcpy(copy, start, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+bool is_ows(char c) { return c == ' ' || c == '\t'; }
+
+char *copy_trimmed_span(const char *start, size_t len) {
+    while (len > 0 && is_ows(*start)) {
+        start++;
+        len--;
+    }
+
+    while (len > 0 && is_ows(start[len - 1])) {
+        len--;
+    }
+
+    return copy_span(start, len);
+}
+
+void lowercase_ascii(char *text) {
+    for (char *p = text; *p; p++) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = *p - 'A' + 'a';
+        }
+    }
+}
+
+const char *find_line_end(const char *start) {
+    const char *crlf = strstr(start, "\r\n");
+    const char *lf = strchr(start, '\n');
+
+    if (crlf && lf) return crlf < lf ? crlf : lf;
+    if (crlf) return crlf;
+    if (lf) return lf;
+    return start + strlen(start);
+}
+
+const char *next_line_start(const char *line_end) {
+    if (line_end[0] == '\r' && line_end[1] == '\n') {
+        return line_end + 2;
+    }
+    if (line_end[0] == '\n') {
+        return line_end + 1;
+    }
+    return line_end;
+}
+
 void println_jsvalue(JSContextRef ctx, JSValueRef value) {
     print_jsvalue(ctx, value);
     printf("\n");
@@ -148,15 +200,6 @@ typedef struct ParsedRequest {
     char *query;
 } ParsedRequest;
 
-char *copy_span(const char *start, size_t len) {
-    char *copy = malloc(len + 1);
-    if (copy == NULL) return NULL;
-
-    memcpy(copy, start, len);
-    copy[len] = '\0';
-    return copy;
-}
-
 void init_parsed_request(ParsedRequest *request) {
     request->method = NULL;
     request->url = NULL;
@@ -177,14 +220,7 @@ bool parse_request_line(const char *raw, ParsedRequest *request) {
 
     init_parsed_request(request);
 
-    const char *line_end = strstr(raw, "\r\n");
-    if (line_end == NULL) {
-        line_end = strchr(raw, '\n');
-    }
-    if (line_end == NULL) {
-        line_end = raw + strlen(raw);
-    }
-
+    const char *line_end = find_line_end(raw);
     const char *method_end = memchr(raw, ' ', (size_t)(line_end - raw));
     if (method_end == NULL || method_end == raw) return false;
 
@@ -219,13 +255,49 @@ bool parse_request_line(const char *raw, ParsedRequest *request) {
     return true;
 }
 
-JSObjectRef make_request_object(JSContextRef ctx, ParsedRequest *request) {
+JSObjectRef parse_request_headers(JSContextRef ctx, const char *raw) {
+    JSObjectRef headers = JSObjectMake(ctx, NULL, NULL);
+    const char *line_end = find_line_end(raw);
+    const char *cursor = next_line_start(line_end);
+
+    while (*cursor) {
+        line_end = find_line_end(cursor);
+        size_t line_len = (size_t)(line_end - cursor);
+        if (line_len > 0 && cursor[line_len - 1] == '\r') {
+            line_len--;
+        }
+
+        if (line_len == 0) return headers;
+
+        const char *colon = memchr(cursor, ':', line_len);
+        if (colon) {
+            char *name = copy_trimmed_span(cursor, (size_t)(colon - cursor));
+            char *value = copy_trimmed_span(
+                colon + 1, line_len - (size_t)(colon - cursor) - 1);
+
+            if (name && value && name[0] != '\0') {
+                lowercase_ascii(name);
+                set_property(ctx, headers, name, make_js_string(ctx, value));
+            }
+            free(name);
+            free(value);
+        }
+
+        cursor = next_line_start(line_end);
+        if (cursor == line_end) return headers;
+    }
+
+    return headers;
+}
+
+JSObjectRef make_request_object(JSContextRef ctx, ParsedRequest *request,
+                                JSObjectRef headers) {
     JSObjectRef req = JSObjectMake(ctx, NULL, NULL);
     set_property(ctx, req, "method", make_js_string(ctx, request->method));
     set_property(ctx, req, "url", make_js_string(ctx, request->url));
     set_property(ctx, req, "path", make_js_string(ctx, request->path));
     set_property(ctx, req, "query", make_js_string(ctx, request->query));
-    set_property(ctx, req, "headers", JSObjectMake(ctx, NULL, NULL));
+    set_property(ctx, req, "headers", headers);
     return req;
 }
 
@@ -493,7 +565,8 @@ char *dispatch_request(Runtime *rt, const char *raw, JSObjectRef handler) {
         return serialize_status_response(400, "bad request\n");
     }
 
-    JSObjectRef req = make_request_object(rt->ctx, &request);
+    JSObjectRef headers = parse_request_headers(rt->ctx, raw);
+    JSObjectRef req = make_request_object(rt->ctx, &request, headers);
     destroy_parsed_request(&request);
 
     JSValueRef args[] = {(JSValueRef)req};
