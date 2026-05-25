@@ -77,12 +77,10 @@ char *jsvalue_to_cstring(JSContextRef ctx, JSValueRef value) {
 
     size_t size = JSStringGetMaximumUTF8CStringSize(str);
     char *cstr = malloc(size);
-    if (cstr == NULL) {
-        JSStringRelease(str);
-        return NULL;
+    if (cstr != NULL) {
+        JSStringGetUTF8CString(str, cstr, size);
     }
 
-    JSStringGetUTF8CString(str, cstr, size);
     JSStringRelease(str);
     return cstr;
 }
@@ -515,6 +513,12 @@ char *read_response_body(JSContextRef ctx, JSObjectRef response) {
     return jsvalue_to_cstring(ctx, value);
 }
 
+JSObjectRef read_response_headers(JSContextRef ctx, JSObjectRef response) {
+    JSValueRef value = get_property(ctx, response, "headers");
+    if (!JSValueIsObject(ctx, value)) return NULL;
+    return JSValueToObject(ctx, value, NULL);
+}
+
 const char *response_reason_phrase(int status) {
     switch (status) {
     case 200:
@@ -549,12 +553,88 @@ char *serialize_status_response(int status, const char *body) {
     return serialized;
 }
 
+size_t response_headers_size(JSContextRef ctx, JSObjectRef headers) {
+    size_t size = 0;
+    JSPropertyNameArrayRef names = JSObjectCopyPropertyNames(ctx, headers);
+    size_t count = JSPropertyNameArrayGetCount(names);
+
+    for (size_t i = 0; i < count; i++) {
+        JSStringRef name = JSPropertyNameArrayGetNameAtIndex(names, i);
+        JSValueRef value = JSObjectGetProperty(ctx, headers, name, NULL);
+        JSValueRef name_value = JSValueMakeString(ctx, name);
+
+        char *name_cstr = jsvalue_to_cstring(ctx, name_value);
+        char *value_cstr = jsvalue_to_cstring(ctx, value);
+        if (name_cstr && value_cstr && name_cstr[0] != '\0') {
+            size += strlen(name_cstr) + strlen(value_cstr) + strlen(": \r\n");
+        }
+
+        free(name_cstr);
+        free(value_cstr);
+    }
+
+    JSPropertyNameArrayRelease(names);
+    return size;
+}
+
+char *write_response_headers(JSContextRef ctx, JSObjectRef headers,
+                             char *cursor) {
+    JSPropertyNameArrayRef names = JSObjectCopyPropertyNames(ctx, headers);
+    size_t count = JSPropertyNameArrayGetCount(names);
+
+    for (size_t i = 0; i < count; i++) {
+        JSStringRef name = JSPropertyNameArrayGetNameAtIndex(names, i);
+        JSValueRef value = JSObjectGetProperty(ctx, headers, name, NULL);
+        JSValueRef name_value = JSValueMakeString(ctx, name);
+
+        char *name_cstr = jsvalue_to_cstring(ctx, name_value);
+        char *value_cstr = jsvalue_to_cstring(ctx, value);
+        if (name_cstr && value_cstr && name_cstr[0] != '\0') {
+            cursor += sprintf(cursor, "%s: %s\r\n", name_cstr, value_cstr);
+        }
+
+        free(name_cstr);
+        free(value_cstr);
+    }
+
+    JSPropertyNameArrayRelease(names);
+    return cursor;
+}
+
 char *serialize_response(JSContextRef ctx, JSObjectRef response) {
     char *body = read_response_body(ctx, response);
     if (body == NULL) return NULL;
 
     int status = read_response_status(ctx, response);
-    char *serialized = serialize_status_response(status, body);
+    const char *reason = response_reason_phrase(status);
+    size_t body_len = strlen(body);
+    JSObjectRef headers = read_response_headers(ctx, response);
+    size_t headers_size = headers ? response_headers_size(ctx, headers) : 0;
+
+    int status_line_size =
+        snprintf(NULL, 0, "HTTP/1.1 %d %s\r\n", status, reason);
+    int body_size =
+        snprintf(NULL, 0, "Content-Length: %zu\r\n\r\n%s", body_len, body);
+    if (status_line_size < 0 || body_size < 0) {
+        free(body);
+        return NULL;
+    }
+
+    size_t total_size =
+        (size_t)status_line_size + headers_size + (size_t)body_size;
+    char *serialized = malloc(total_size + 1);
+    if (serialized == NULL) {
+        free(body);
+        return NULL;
+    }
+
+    char *cursor = serialized;
+    cursor += sprintf(cursor, "HTTP/1.1 %d %s\r\n", status, reason);
+    if (headers) {
+        cursor = write_response_headers(ctx, headers, cursor);
+    }
+    sprintf(cursor, "Content-Length: %zu\r\n\r\n%s", body_len, body);
+
     free(body);
     return serialized;
 }
