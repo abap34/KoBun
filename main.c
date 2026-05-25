@@ -139,6 +139,96 @@ void sleep_until(int64_t deadline_ms) {
     }
 }
 
+// ==== HTTP request parsing ====
+
+typedef struct ParsedRequest {
+    char *method;
+    char *url;
+    char *path;
+    char *query;
+} ParsedRequest;
+
+char *copy_span(const char *start, size_t len) {
+    char *copy = malloc(len + 1);
+    if (copy == NULL) return NULL;
+
+    memcpy(copy, start, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+void init_parsed_request(ParsedRequest *request) {
+    request->method = NULL;
+    request->url = NULL;
+    request->path = NULL;
+    request->query = NULL;
+}
+
+void destroy_parsed_request(ParsedRequest *request) {
+    free(request->method);
+    free(request->url);
+    free(request->path);
+    free(request->query);
+    init_parsed_request(request);
+}
+
+bool parse_request_line(const char *raw, ParsedRequest *request) {
+    if (raw == NULL || request == NULL) return false;
+
+    init_parsed_request(request);
+
+    const char *line_end = strstr(raw, "\r\n");
+    if (line_end == NULL) {
+        line_end = strchr(raw, '\n');
+    }
+    if (line_end == NULL) {
+        line_end = raw + strlen(raw);
+    }
+
+    const char *method_end = memchr(raw, ' ', (size_t)(line_end - raw));
+    if (method_end == NULL || method_end == raw) return false;
+
+    const char *url_start = method_end + 1;
+    const char *url_end =
+        memchr(url_start, ' ', (size_t)(line_end - url_start));
+    if (url_end == NULL || url_end == url_start) return false;
+
+    const char *version_start = url_end + 1;
+    if (version_start >= line_end) return false;
+
+    request->method = copy_span(raw, (size_t)(method_end - raw));
+    request->url = copy_span(url_start, (size_t)(url_end - url_start));
+
+    const char *query_start =
+        memchr(url_start, '?', (size_t)(url_end - url_start));
+    if (query_start) {
+        request->path = copy_span(url_start, (size_t)(query_start - url_start));
+        request->query =
+            copy_span(query_start + 1, (size_t)(url_end - query_start - 1));
+    } else {
+        request->path = copy_span(url_start, (size_t)(url_end - url_start));
+        request->query = copy_span("", 0);
+    }
+
+    if (request->method == NULL || request->url == NULL ||
+        request->path == NULL || request->query == NULL) {
+        destroy_parsed_request(request);
+        return false;
+    }
+
+    return true;
+}
+
+JSObjectRef make_request_object(JSContextRef ctx, ParsedRequest *request) {
+    JSObjectRef req = JSObjectMake(ctx, NULL, NULL);
+    set_property(ctx, req, "method", make_js_string(ctx, request->method));
+    set_property(ctx, req, "url", make_js_string(ctx, request->url));
+    set_property(ctx, req, "path", make_js_string(ctx, request->path));
+    set_property(ctx, req, "query", make_js_string(ctx, request->query));
+    set_property(ctx, req, "headers", JSObjectMake(ctx, NULL, NULL));
+    return req;
+}
+
 // ==== Runtime management ====
 
 void init_rt(Runtime *rt) {
@@ -357,11 +447,34 @@ const char *response_reason_phrase(int status) {
     switch (status) {
     case 200:
         return "OK";
+    case 400:
+        return "Bad Request";
     case 404:
         return "Not Found";
+    case 500:
+        return "Internal Server Error";
     default:
         return "OK";
     }
+}
+
+char *serialize_status_response(int status, const char *body) {
+    const char *reason = response_reason_phrase(status);
+    size_t body_len = strlen(body);
+
+    int size =
+        snprintf(NULL, 0, "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n\r\n%s",
+                 status, reason, body_len, body);
+    if (size < 0) return NULL;
+
+    char *serialized = malloc((size_t)size + 1);
+    if (serialized == NULL) return NULL;
+
+    snprintf(serialized, (size_t)size + 1,
+             "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n\r\n%s", status, reason,
+             body_len, body);
+
+    return serialized;
 }
 
 char *serialize_response(JSContextRef ctx, JSObjectRef response) {
@@ -369,28 +482,39 @@ char *serialize_response(JSContextRef ctx, JSObjectRef response) {
     if (body == NULL) return NULL;
 
     int status = read_response_status(ctx, response);
-    const char *reason = response_reason_phrase(status);
-    size_t body_len = strlen(body);
-
-    int size =
-        snprintf(NULL, 0, "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n\r\n%s",
-                 status, reason, body_len, body);
-    if (size < 0) {
-        free(body);
-        return NULL;
-    }
-
-    char *serialized = malloc((size_t)size + 1);
-    if (serialized == NULL) {
-        free(body);
-        return NULL;
-    }
-
-    snprintf(serialized, (size_t)size + 1,
-             "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n\r\n%s", status, reason,
-             body_len, body);
-
+    char *serialized = serialize_status_response(status, body);
     free(body);
+    return serialized;
+}
+
+char *dispatch_request(Runtime *rt, const char *raw, JSObjectRef handler) {
+    ParsedRequest request;
+    if (!parse_request_line(raw, &request)) {
+        return serialize_status_response(400, "bad request\n");
+    }
+
+    JSObjectRef req = make_request_object(rt->ctx, &request);
+    destroy_parsed_request(&request);
+
+    JSValueRef args[] = {(JSValueRef)req};
+    JSValueRef exception = NULL;
+    JSValueRef result =
+        JSObjectCallAsFunction(rt->ctx, handler, NULL, 1, args, &exception);
+
+    if (exception || result == NULL || !is_response(rt, rt->ctx, result)) {
+        return serialize_status_response(500, "internal server error\n");
+    }
+
+    JSObjectRef response = JSValueToObject(rt->ctx, result, NULL);
+    if (response == NULL) {
+        return serialize_status_response(500, "internal server error\n");
+    }
+
+    char *serialized = serialize_response(rt->ctx, response);
+    if (serialized == NULL) {
+        return serialize_status_response(500, "internal server error\n");
+    }
+
     return serialized;
 }
 
