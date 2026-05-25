@@ -2,12 +2,15 @@
 // Copyright (c) 2026 Yuchi Yamaguchi under the MIT License.
 
 #include <JavaScriptCore/JavaScriptCore.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 // Atomic operation for event loop.
 typedef struct Task {
@@ -31,6 +34,14 @@ typedef struct HostClasses {
     JSClassRef response;
 } HostClasses;
 
+typedef struct ServerResource {
+    int listen_fd;
+    int port;
+    char *hostname;
+    JSObjectRef fetch;
+    bool active;
+} ServerResource;
+
 typedef struct Runtime {
     // JavaScriptCore context
     JSGlobalContextRef ctx;
@@ -44,11 +55,35 @@ typedef struct Runtime {
 
     // host classes
     HostClasses host_classes;
+
+    // server resource
+    ServerResource server;
 } Runtime;
 
 int gen_task_id(Runtime *rt) {
     rt->_task_id_counter++;
     return rt->_task_id_counter;
+}
+
+void init_server(ServerResource *server) {
+    server->listen_fd = -1;
+    server->port = 0;
+    server->hostname = NULL;
+    server->fetch = NULL;
+    server->active = false;
+}
+
+void destroy_server(Runtime *rt, ServerResource *server) {
+    if (server->fetch) {
+        JSValueUnprotect(rt->ctx, server->fetch);
+    }
+
+    if (server->listen_fd >= 0) {
+        close(server->listen_fd);
+    }
+
+    free(server->hostname);
+    init_server(server);
 }
 
 // ==== Utilities ====
@@ -307,6 +342,7 @@ void init_rt(Runtime *rt) {
     rt->task_queue_head = NULL;
     rt->task_queue_tail = NULL;
     rt->_task_id_counter = 0;
+    init_server(&rt->server);
 }
 
 void create_context(Runtime *rt) {
@@ -325,6 +361,60 @@ void attach_runtime(Runtime *rt) {
 Runtime *get_rt(JSContextRef ctx) {
     JSObjectRef global = JSContextGetGlobalObject(ctx);
     return (Runtime *)JSObjectGetPrivate(global);
+}
+
+// ==== Server resource ====
+
+bool start_server(Runtime *rt, int port, JSObjectRef fetch) {
+    if (rt->server.active) return false;
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) return false;
+
+    int reuse = 1;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
+        0) {
+        close(listen_fd);
+        return false;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(listen_fd);
+        return false;
+    }
+
+    if (listen(listen_fd, 128) < 0) {
+        close(listen_fd);
+        return false;
+    }
+
+    char *hostname = copy_span("0.0.0.0", strlen("0.0.0.0"));
+    if (hostname == NULL) {
+        close(listen_fd);
+        return false;
+    }
+
+    rt->server.listen_fd = listen_fd;
+    rt->server.port = port;
+    rt->server.hostname = hostname;
+    rt->server.fetch = fetch;
+    rt->server.active = true;
+    JSValueProtect(rt->ctx, fetch);
+    return true;
+}
+
+JSObjectRef make_server_object(JSContextRef ctx, ServerResource *server) {
+    JSObjectRef object = JSObjectMake(ctx, NULL, NULL);
+    set_property(ctx, object, "hostname",
+                 make_js_string(ctx, server->hostname));
+    set_property(ctx, object, "port", JSValueMakeNumber(ctx, server->port));
+    return object;
 }
 
 // ==== Task queue ====
@@ -750,6 +840,41 @@ JSValueRef set_timeout_callback(JSContextRef ctx, JSObjectRef func,
     return JSValueMakeNumber(ctx, task_id);
 }
 
+JSValueRef kobun_serve_callback(JSContextRef ctx, JSObjectRef func,
+                                JSObjectRef thisObject, size_t argumentCount,
+                                const JSValueRef arguments[],
+                                JSValueRef *exception) {
+    (void)func;
+    (void)thisObject;
+    (void)exception;
+
+    if (argumentCount < 1 || !JSValueIsObject(ctx, arguments[0])) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef options = JSValueToObject(ctx, arguments[0], NULL);
+    JSValueRef port_value = get_property(ctx, options, "port");
+    JSValueRef fetch_value = get_property(ctx, options, "fetch");
+
+    if (!JSValueIsNumber(ctx, port_value) ||
+        !JSValueIsObject(ctx, fetch_value)) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int port = (int)JSValueToNumber(ctx, port_value, NULL);
+    JSObjectRef fetch = JSValueToObject(ctx, fetch_value, NULL);
+    if (port < 0 || port > 65535 || !JSObjectIsFunction(ctx, fetch)) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    Runtime *rt = get_rt(ctx);
+    if (!start_server(rt, port, fetch)) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    return make_server_object(ctx, &rt->server);
+}
+
 JSObjectRef get_builtin_parent(Runtime *rt, const char *object_name) {
     JSObjectRef global = JSContextGetGlobalObject(rt->ctx);
     if (object_name == NULL) return global;
@@ -789,6 +914,7 @@ static struct {
 } builtins[] = {
     {NULL, "setTimeout", set_timeout_callback},
     {"console", "log", console_log_callback},
+    {"Kobun", "serve", kobun_serve_callback},
 };
 
 void install_builtins(Runtime *rt) {
@@ -811,6 +937,7 @@ void setup_rt(Runtime *rt) {
 
 void destroy_rt(Runtime *rt) {
     destroy_pending_tasks(rt);
+    destroy_server(rt, &rt->server);
 
     if (rt->ctx) {
         JSGlobalContextRelease(rt->ctx);
