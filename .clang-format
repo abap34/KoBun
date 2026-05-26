@@ -6,3 +6,4 @@ UseTab: Never
 AllowShortIfStatementsOnASingleLine: WithoutElse
 AllowShortBlocksOnASingleLine: Always
 AllowShortLoopsOnASingleLine: true
+RemoveBracesLLVM: true

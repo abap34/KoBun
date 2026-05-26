@@ -13,12 +13,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#define READ_BUFFER_SIZE 8192
+#define SERVER_HOSTNAME "0.0.0.0"
+#define ARRAY_LEN(xs) (sizeof(xs) / sizeof((xs)[0]))
+
 // Atomic operation for event loop.
 typedef struct Task {
     // unique task id
     int id;
-    // deadline in milliseconds in Unix time. For Promise.then, it can be 0 or
-    // ignored.
+    // deadline in milliseconds on the MONOTONIC clock.
     int64_t deadline_ms;
     // callback function. Firstly we support no-argument callback for
     // simplicity.
@@ -33,10 +36,12 @@ typedef struct HostClasses {
 } HostClasses;
 
 typedef struct ServerResource {
+    // File descriptor for the listening socket. -1 means no server is listening.
     int listen_fd;
+    // Port number the server is listening on. Meaningful only if listen_fd >= 0.
     int port;
+    // The fetch function provided by JavaScript. Meaningful only if listen_fd >= 0.
     JSObjectRef fetch;
-    bool active;
 } ServerResource;
 
 typedef struct Runtime {
@@ -53,35 +58,11 @@ typedef struct Runtime {
     ServerResource server;
 } Runtime;
 
-int64_t tq_next_deadline(Runtime *rt);
-char *dispatch_request(Runtime *rt, const char *raw, JSObjectRef handler);
-
-int gen_task_id(Runtime *rt) {
-    rt->_task_id_counter++;
-    return rt->_task_id_counter;
-}
-
-#define READ_BUFFER_SIZE 8192
-#define SERVER_HOSTNAME "0.0.0.0"
-
-void init_server(ServerResource *server) {
-    server->listen_fd = -1;
-    server->port = 0;
-    server->fetch = NULL;
-    server->active = false;
-}
-
-void destroy_server(Runtime *rt, ServerResource *server) {
-    if (server->fetch) { JSValueUnprotect(rt->ctx, server->fetch); }
-    if (server->listen_fd >= 0) { close(server->listen_fd); }
-    init_server(server);
-}
-
 // ==== Utilities ====
 
 char *read_file(char *path) {
     FILE *file = fopen(path, "r");
-    if (!file) { return NULL; }
+    if (!file) return NULL;
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
     rewind(file);
@@ -98,7 +79,7 @@ char *jsvalue_to_cstring(JSContextRef ctx, JSValueRef value) {
     if (str == NULL) return NULL;
     size_t size = JSStringGetMaximumUTF8CStringSize(str);
     char *cstr = malloc(size);
-    if (cstr != NULL) { JSStringGetUTF8CString(str, cstr, size); }
+    if (cstr != NULL) JSStringGetUTF8CString(str, cstr, size);
     JSStringRelease(str);
     return cstr;
 }
@@ -139,6 +120,12 @@ char *copy_span(const char *start, size_t len) {
     return copy;
 }
 
+char *copy_range(const char *start, const char *end) { return copy_span(start, (size_t)(end - start)); }
+
+const char *find_char_before(const char *start, const char *end, char ch) {
+    return memchr(start, ch, (size_t)(end - start));
+}
+
 bool is_ows(char c) { return c == ' ' || c == '\t'; }
 
 char *copy_trimmed_span(const char *start, size_t len) {
@@ -146,14 +133,13 @@ char *copy_trimmed_span(const char *start, size_t len) {
         start++;
         len--;
     }
-    while (len > 0 && is_ows(start[len - 1])) { len--; }
+    while (len > 0 && is_ows(start[len - 1])) len--;
     return copy_span(start, len);
 }
 
 void lowercase_ascii(char *text) {
-    for (char *p = text; *p; p++) {
-        if (*p >= 'A' && *p <= 'Z') { *p = *p - 'A' + 'a'; }
-    }
+    for (char *p = text; *p; p++)
+        if (*p >= 'A' && *p <= 'Z') *p = *p - 'A' + 'a';
 }
 
 const char *find_line_end(const char *start) {
@@ -166,8 +152,8 @@ const char *find_line_end(const char *start) {
 }
 
 const char *next_line_start(const char *line_end) {
-    if (line_end[0] == '\r' && line_end[1] == '\n') { return line_end + 2; }
-    if (line_end[0] == '\n') { return line_end + 1; }
+    if (line_end[0] == '\r' && line_end[1] == '\n') return line_end + 2;
+    if (line_end[0] == '\n') return line_end + 1;
     return line_end;
 }
 
@@ -216,35 +202,36 @@ void destroy_parsed_request(ParsedRequest *request) {
     init_parsed_request(request);
 }
 
+bool copy_request_target(ParsedRequest *request, const char *start, const char *end) {
+    const char *query_start = find_char_before(start, end, '?');
+    const char *path_end = query_start ? query_start : end;
+    const char *query_value_start = query_start ? query_start + 1 : end;
+
+    request->path = copy_range(start, path_end);
+    request->query = copy_range(query_value_start, end);
+    return request->path != NULL && request->query != NULL;
+}
+
 bool parse_request_line(const char *raw, ParsedRequest *request) {
-    if (raw == NULL || request == NULL) return false;
+    if (request == NULL) return false;
 
     init_parsed_request(request);
+    if (raw == NULL) return false;
 
     const char *line_end = find_line_end(raw);
-    const char *method_end = memchr(raw, ' ', (size_t)(line_end - raw));
+    const char *method_end = find_char_before(raw, line_end, ' ');
     if (method_end == NULL || method_end == raw) return false;
 
     const char *url_start = method_end + 1;
-    const char *url_end = memchr(url_start, ' ', (size_t)(line_end - url_start));
+    const char *url_end = find_char_before(url_start, line_end, ' ');
     if (url_end == NULL || url_end == url_start) return false;
 
     const char *version_start = url_end + 1;
     if (version_start >= line_end) return false;
 
-    request->method = copy_span(raw, (size_t)(method_end - raw));
-    request->url = copy_span(url_start, (size_t)(url_end - url_start));
-
-    const char *query_start = memchr(url_start, '?', (size_t)(url_end - url_start));
-    if (query_start) {
-        request->path = copy_span(url_start, (size_t)(query_start - url_start));
-        request->query = copy_span(query_start + 1, (size_t)(url_end - query_start - 1));
-    } else {
-        request->path = copy_span(url_start, (size_t)(url_end - url_start));
-        request->query = copy_span("", 0);
-    }
-
-    if (request->method == NULL || request->url == NULL || request->path == NULL || request->query == NULL) {
+    request->method = copy_range(raw, method_end);
+    request->url = copy_range(url_start, url_end);
+    if (request->method == NULL || request->url == NULL || !copy_request_target(request, url_start, url_end)) {
         destroy_parsed_request(request);
         return false;
     }
@@ -260,7 +247,7 @@ JSObjectRef parse_request_headers(JSContextRef ctx, const char *raw) {
     while (*cursor) {
         line_end = find_line_end(cursor);
         size_t line_len = (size_t)(line_end - cursor);
-        if (line_len > 0 && cursor[line_len - 1] == '\r') { line_len--; }
+        if (line_len > 0 && cursor[line_len - 1] == '\r') line_len--;
         if (line_len == 0) return headers;
         const char *colon = memchr(cursor, ':', line_len);
         if (colon) {
@@ -289,6 +276,194 @@ JSObjectRef make_request_object(JSContextRef ctx, ParsedRequest *request, JSObje
     set_property(ctx, req, "query", make_js_string(ctx, request->query));
     set_property(ctx, req, "headers", headers);
     return req;
+}
+
+// ==== Task queue ====
+
+int gen_task_id(Runtime *rt) {
+    rt->_task_id_counter++;
+    return rt->_task_id_counter;
+}
+
+bool tq_is_empty(Runtime *rt) { return rt->task_queue_head == NULL; }
+
+int64_t tq_next_deadline(Runtime *rt) {
+    if (rt->task_queue_head) return rt->task_queue_head->deadline_ms;
+    return -1;
+}
+
+Task *create_task(Runtime *rt, JSObjectRef callback, int64_t deadline_ms) {
+    Task *task = malloc(sizeof(Task));
+    task->id = gen_task_id(rt);
+    task->callback = callback;
+    task->deadline_ms = deadline_ms;
+    task->next = NULL;
+    JSValueProtect(rt->ctx, callback);
+    return task;
+}
+
+// Important NOTE: Before & After `tq_push`,
+// the earliest deadline task is always at the head of the queue
+void tq_push(Runtime *rt, Task *task) {
+    if (tq_is_empty(rt)) {
+        rt->task_queue_head = task;
+        rt->task_queue_tail = task;
+        return;
+    }
+
+    if (task->deadline_ms < tq_next_deadline(rt)) {
+        task->next = rt->task_queue_head;
+        rt->task_queue_head = task;
+        return;
+    }
+
+    Task *prev = rt->task_queue_head;
+    while (prev->next && prev->next->deadline_ms <= task->deadline_ms) prev = prev->next;
+
+    task->next = prev->next;
+    prev->next = task;
+
+    if (task->next == NULL) rt->task_queue_tail = task;
+}
+
+Task *tq_pop(Runtime *rt) {
+    Task *task = rt->task_queue_head;
+    if (task == NULL) return NULL;
+
+    rt->task_queue_head = task->next;
+    if (rt->task_queue_head == NULL) rt->task_queue_tail = NULL;
+
+    task->next = NULL;
+    return task;
+}
+
+// Insert a task into the task queue. Return the generated task id.
+int add_task(Runtime *rt, JSObjectRef callback, int64_t deadline_ms) {
+    Task *task = create_task(rt, callback, deadline_ms);
+    tq_push(rt, task);
+    return task->id;
+}
+
+void destroy_task(Runtime *rt, Task *task) {
+    JSValueUnprotect(rt->ctx, task->callback);
+    free(task);
+}
+
+void destroy_pending_tasks(Runtime *rt) {
+    while (!tq_is_empty(rt)) {
+        Task *task = tq_pop(rt);
+        destroy_task(rt, task);
+    }
+}
+
+bool deadline_overdue(int64_t deadline_ms) { return current_time_ms() >= deadline_ms; }
+
+bool tq_has_due_task(Runtime *rt) { return !tq_is_empty(rt) && deadline_overdue(tq_next_deadline(rt)); }
+
+// Execute a task by calling its callback function.
+bool execute(Runtime *rt, Task *task) {
+    JSValueRef exception = NULL;
+    JSObjectCallAsFunction(rt->ctx, task->callback, NULL, 0, NULL, &exception);
+    if (exception) {
+        printf("Error: ");
+        println_jsvalue(rt->ctx, exception);
+        return false;
+    }
+    return true;
+}
+
+// Check if there are tasks that can be consumed (i.e., their deadline has passed)
+// and execute them. Return false on failure; otherwise, return true.
+bool may_consume_tasks(Runtime *rt) {
+    while (tq_has_due_task(rt)) {
+        Task *task = tq_pop(rt);
+        bool ok = execute(rt, task);
+        destroy_task(rt, task);
+
+        if (!ok) return false;
+    }
+
+    return true;
+}
+
+// ==== Server resource ====
+
+void init_server(ServerResource *server) {
+    server->listen_fd = -1;
+    server->port = 0;
+    server->fetch = NULL;
+}
+
+void destroy_server(Runtime *rt, ServerResource *server) {
+    if (server->fetch) JSValueUnprotect(rt->ctx, server->fetch);
+    if (server->listen_fd >= 0) close(server->listen_fd);
+    init_server(server);
+}
+
+bool isactive_server(Runtime *rt) { return rt->server.listen_fd >= 0; }
+
+bool start_server(Runtime *rt, int port, JSObjectRef fetch) {
+    if (isactive_server(rt)) return false;
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) return false;
+
+    int reuse = 1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0 ||
+        bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(listen_fd, 128) < 0) {
+        close(listen_fd);
+        return false;
+    }
+
+    rt->server.listen_fd = listen_fd;
+    rt->server.port = port;
+    rt->server.fetch = fetch;
+    JSValueProtect(rt->ctx, fetch);
+    return true;
+}
+
+JSObjectRef make_server_object(JSContextRef ctx, ServerResource *server) {
+    JSObjectRef object = JSObjectMake(ctx, NULL, NULL);
+    set_property(ctx, object, "hostname", make_js_string(ctx, SERVER_HOSTNAME));
+    set_property(ctx, object, "port", JSValueMakeNumber(ctx, server->port));
+    return object;
+}
+
+bool request_has_header_end(const char *request) { return strstr(request, "\r\n\r\n") != NULL; }
+
+char *read_http_request(int client_fd) {
+    char buffer[READ_BUFFER_SIZE];
+    size_t used = 0;
+
+    while (used < sizeof(buffer) - 1) {
+        ssize_t n = read(client_fd, buffer + used, sizeof(buffer) - 1 - used);
+        if (n <= 0) return NULL;
+        used += (size_t)n;
+        buffer[used] = '\0';
+
+        if (request_has_header_end(buffer)) return copy_span(buffer, used);
+    }
+
+    return copy_span(buffer, used);
+}
+
+bool write_all(int fd, const char *data) {
+    size_t len = strlen(data);
+    size_t written = 0;
+
+    while (written < len) {
+        ssize_t n = write(fd, data + written, len - written);
+        if (n <= 0) return false;
+        written += (size_t)n;
+    }
+
+    return true;
 }
 
 // ==== Runtime management ====
@@ -320,246 +495,6 @@ Runtime *get_rt(JSContextRef ctx) {
     return (Runtime *)JSObjectGetPrivate(global);
 }
 
-// ==== Server resource ====
-
-bool has_active_server(Runtime *rt) { return rt->server.active && rt->server.listen_fd >= 0; }
-
-bool start_server(Runtime *rt, int port, JSObjectRef fetch) {
-    if (rt->server.active) return false;
-
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) return false;
-
-    int reuse = 1;
-    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        close(listen_fd);
-        return false;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(listen_fd);
-        return false;
-    }
-
-    if (listen(listen_fd, 128) < 0) {
-        close(listen_fd);
-        return false;
-    }
-
-    rt->server.listen_fd = listen_fd;
-    rt->server.port = port;
-    rt->server.fetch = fetch;
-    rt->server.active = true;
-    JSValueProtect(rt->ctx, fetch);
-    return true;
-}
-
-JSObjectRef make_server_object(JSContextRef ctx, ServerResource *server) {
-    JSObjectRef object = JSObjectMake(ctx, NULL, NULL);
-    set_property(ctx, object, "hostname", make_js_string(ctx, SERVER_HOSTNAME));
-    set_property(ctx, object, "port", JSValueMakeNumber(ctx, server->port));
-    return object;
-}
-
-bool request_has_header_end(const char *request) { return strstr(request, "\r\n\r\n") != NULL; }
-
-char *read_http_request(int client_fd) {
-    char buffer[READ_BUFFER_SIZE];
-    size_t used = 0;
-
-    while (used < sizeof(buffer) - 1) {
-        ssize_t n = read(client_fd, buffer + used, sizeof(buffer) - 1 - used);
-        if (n <= 0) return NULL;
-        used += (size_t)n;
-        buffer[used] = '\0';
-
-        if (request_has_header_end(buffer)) { return copy_span(buffer, used); }
-    }
-
-    return copy_span(buffer, used);
-}
-
-bool write_all(int fd, const char *data) {
-    size_t len = strlen(data);
-    size_t written = 0;
-
-    while (written < len) {
-        ssize_t n = write(fd, data + written, len - written);
-        if (n <= 0) return false;
-        written += (size_t)n;
-    }
-
-    return true;
-}
-
-bool handle_server_connection(Runtime *rt) {
-    int client_fd = accept(rt->server.listen_fd, NULL, NULL);
-    if (client_fd < 0) return false;
-
-    char *request = read_http_request(client_fd);
-    if (request == NULL) {
-        close(client_fd);
-        return false;
-    }
-
-    char *response = dispatch_request(rt, request, rt->server.fetch);
-    free(request);
-    if (response == NULL) {
-        close(client_fd);
-        return false;
-    }
-
-    bool ok = write_all(client_fd, response);
-    free(response);
-    close(client_fd);
-    return ok;
-}
-
-bool wait_for_events(Runtime *rt) {
-    if (!has_active_server(rt)) {
-        int64_t next = tq_next_deadline(rt);
-        if (next >= 0) sleep_until(next);
-        return true;
-    }
-
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(rt->server.listen_fd, &read_fds);
-
-    struct timeval timeout;
-    struct timeval *timeout_ptr = NULL;
-    int64_t next = tq_next_deadline(rt);
-    if (next >= 0) {
-        int64_t now = current_time_ms();
-        int64_t timeout_ms = next > now ? next - now : 0;
-        timeout.tv_sec = timeout_ms / 1000;
-        timeout.tv_usec = (timeout_ms % 1000) * 1000;
-        timeout_ptr = &timeout;
-    }
-
-    int ready = select(rt->server.listen_fd + 1, &read_fds, NULL, NULL, timeout_ptr);
-    if (ready < 0) return false;
-    if (ready == 0) return true;
-
-    if (FD_ISSET(rt->server.listen_fd, &read_fds)) { return handle_server_connection(rt); }
-
-    return true;
-}
-
-// ==== Task queue ====
-
-bool tq_is_empty(Runtime *rt) { return rt->task_queue_head == NULL; }
-
-int64_t tq_next_deadline(Runtime *rt) {
-    if (rt->task_queue_head) { return rt->task_queue_head->deadline_ms; }
-    return -1;
-}
-
-Task *create_task(Runtime *rt, JSObjectRef callback, int64_t deadline_ms) {
-    Task *task = malloc(sizeof(Task));
-    task->id = gen_task_id(rt);
-    task->callback = callback;
-    task->deadline_ms = deadline_ms;
-    task->next = NULL;
-    JSValueProtect(rt->ctx, callback);
-    return task;
-}
-
-// Important note: The head of the queue is the task with the earliest deadline.
-void tq_push(Runtime *rt, Task *task) {
-    if (tq_is_empty(rt)) {
-        rt->task_queue_head = task;
-        rt->task_queue_tail = task;
-        return;
-    }
-
-    if (task->deadline_ms < tq_next_deadline(rt)) {
-        task->next = rt->task_queue_head;
-        rt->task_queue_head = task;
-        return;
-    }
-
-    Task *prev = rt->task_queue_head;
-    while (prev->next && prev->next->deadline_ms <= task->deadline_ms) { prev = prev->next; }
-
-    task->next = prev->next;
-    prev->next = task;
-
-    if (task->next == NULL) { rt->task_queue_tail = task; }
-}
-
-Task *tq_pop(Runtime *rt) {
-    Task *task = rt->task_queue_head;
-    if (task == NULL) return NULL;
-
-    rt->task_queue_head = task->next;
-    if (rt->task_queue_head == NULL) { rt->task_queue_tail = NULL; }
-
-    task->next = NULL;
-    return task;
-}
-
-// Insert a task into the task queue. Return the generated task id.
-int add_task(Runtime *rt, JSObjectRef callback, int64_t deadline_ms) {
-    Task *task = create_task(rt, callback, deadline_ms);
-    tq_push(rt, task);
-    return task->id;
-}
-
-void destroy_task(Runtime *rt, Task *task) {
-    JSValueUnprotect(rt->ctx, task->callback);
-    free(task);
-}
-
-void destroy_pending_tasks(Runtime *rt) {
-    while (!tq_is_empty(rt)) {
-        Task *task = tq_pop(rt);
-        destroy_task(rt, task);
-    }
-}
-
-bool deadline_overdue(int64_t deadline_ms) { return current_time_ms() >= deadline_ms; }
-
-bool tq_has_due_task(Runtime *rt) { return !tq_is_empty(rt) && deadline_overdue(tq_next_deadline(rt)); }
-
-// Execute a task by calling its callback function.
-// The callback's return value is ignored, as in setTimeout.
-bool execute(Runtime *rt, Task *task) {
-    JSValueRef exception = NULL;
-    JSObjectCallAsFunction(rt->ctx, task->callback, NULL, 0, NULL, &exception);
-    if (exception) {
-        printf("Error: ");
-        println_jsvalue(rt->ctx, exception);
-        return false;
-    }
-    return true;
-}
-
-// Check if there is a task that can be consumed (i.e., its deadline has passed)
-// and execute it. Return -1 on failure; otherwise, return a number of executed
-// tasks.
-int may_consume_task(Runtime *rt) {
-    int execute_count = 0;
-    while (tq_has_due_task(rt)) {
-        Task *task = tq_pop(rt);
-
-        if (!execute(rt, task)) {
-            destroy_task(rt, task);
-            return -1;
-        }
-
-        execute_count++;
-        destroy_task(rt, task);
-    }
-    return execute_count;
-}
-
 // ==== Builtin classes/functions ====
 
 JSObjectRef response_constructor(JSContextRef ctx, JSObjectRef constructor, size_t argumentCount,
@@ -574,24 +509,25 @@ JSObjectRef response_constructor(JSContextRef ctx, JSObjectRef constructor, size
     JSObjectSetPrototype(ctx, response, prototype);
     JSStringRelease(prototype_name);
 
+    JSObjectRef init = NULL;
+    if (argumentCount > 1 && JSValueIsObject(ctx, arguments[1])) init = JSValueToObject(ctx, arguments[1], NULL);
+
     JSValueRef body = argumentCount > 0 ? arguments[0] : make_js_string(ctx, "");
     set_property(ctx, response, "body", body);
 
     int status = 200;
-    if (argumentCount > 1 && JSValueIsObject(ctx, arguments[1])) {
-        JSObjectRef init = JSValueToObject(ctx, arguments[1], NULL);
+    if (init) {
         JSValueRef status_value = get_property(ctx, init, "status");
-        if (JSValueIsNumber(ctx, status_value)) { status = (int)JSValueToNumber(ctx, status_value, NULL); }
+        if (JSValueIsNumber(ctx, status_value)) status = (int)JSValueToNumber(ctx, status_value, NULL);
     }
     set_property(ctx, response, "status", JSValueMakeNumber(ctx, status));
 
     JSObjectRef headers = JSObjectMake(ctx, NULL, NULL);
 
-    if (argumentCount > 1 && JSValueIsObject(ctx, arguments[1])) {
-        JSObjectRef init = JSValueToObject(ctx, arguments[1], NULL);
+    if (init) {
         JSValueRef headers_value = get_property(ctx, init, "headers");
 
-        if (JSValueIsObject(ctx, headers_value)) { headers = JSValueToObject(ctx, headers_value, NULL); }
+        if (JSValueIsObject(ctx, headers_value)) headers = JSValueToObject(ctx, headers_value, NULL);
     }
 
     set_property(ctx, response, "headers", headers);
@@ -660,9 +596,8 @@ size_t response_headers_size(JSContextRef ctx, JSObjectRef headers) {
         JSValueRef name_value = JSValueMakeString(ctx, name);
         char *name_cstr = jsvalue_to_cstring(ctx, name_value);
         char *value_cstr = jsvalue_to_cstring(ctx, value);
-        if (name_cstr && value_cstr && name_cstr[0] != '\0') {
+        if (name_cstr && value_cstr && name_cstr[0] != '\0')
             size += strlen(name_cstr) + strlen(value_cstr) + strlen(": \r\n");
-        }
 
         free(name_cstr);
         free(value_cstr);
@@ -683,9 +618,8 @@ char *write_response_headers(JSContextRef ctx, JSObjectRef headers, char *cursor
 
         char *name_cstr = jsvalue_to_cstring(ctx, name_value);
         char *value_cstr = jsvalue_to_cstring(ctx, value);
-        if (name_cstr && value_cstr && name_cstr[0] != '\0') {
+        if (name_cstr && value_cstr && name_cstr[0] != '\0')
             cursor += sprintf(cursor, "%s: %s\r\n", name_cstr, value_cstr);
-        }
 
         free(name_cstr);
         free(value_cstr);
@@ -721,7 +655,7 @@ char *serialize_response(JSContextRef ctx, JSObjectRef response) {
 
     char *cursor = serialized;
     cursor += sprintf(cursor, "HTTP/1.1 %d %s\r\n", status, reason);
-    if (headers) { cursor = write_response_headers(ctx, headers, cursor); }
+    if (headers) cursor = write_response_headers(ctx, headers, cursor);
     sprintf(cursor, "Content-Length: %zu\r\n\r\n%s", body_len, body);
 
     free(body);
@@ -730,7 +664,7 @@ char *serialize_response(JSContextRef ctx, JSObjectRef response) {
 
 char *dispatch_request(Runtime *rt, const char *raw, JSObjectRef handler) {
     ParsedRequest request;
-    if (!parse_request_line(raw, &request)) { return serialize_status_response(400, "bad request\n"); }
+    if (!parse_request_line(raw, &request)) return serialize_status_response(400, "bad request\n");
 
     JSObjectRef headers = parse_request_headers(rt->ctx, raw);
     JSObjectRef req = make_request_object(rt->ctx, &request, headers);
@@ -740,15 +674,67 @@ char *dispatch_request(Runtime *rt, const char *raw, JSObjectRef handler) {
     JSValueRef exception = NULL;
     JSValueRef result = JSObjectCallAsFunction(rt->ctx, handler, NULL, 1, args, &exception);
 
-    if (exception || result == NULL || !is_response(rt, rt->ctx, result)) {
+    if (exception || result == NULL || !is_response(rt, rt->ctx, result))
         return serialize_status_response(500, "internal server error\n");
-    }
 
     JSObjectRef response = JSValueToObject(rt->ctx, result, NULL);
     char *serialized = serialize_response(rt->ctx, response);
-    if (serialized == NULL) { return serialize_status_response(500, "internal server error\n"); }
+    if (serialized == NULL) return serialize_status_response(500, "internal server error\n");
 
     return serialized;
+}
+
+bool handle_server_connection(Runtime *rt) {
+    int client_fd = accept(rt->server.listen_fd, NULL, NULL);
+    char *request = NULL;
+    char *response = NULL;
+    bool ok = client_fd >= 0 && (request = read_http_request(client_fd)) != NULL &&
+              (response = dispatch_request(rt, request, rt->server.fetch)) != NULL && write_all(client_fd, response);
+
+    free(request);
+    free(response);
+    if (client_fd >= 0) close(client_fd);
+    return ok;
+}
+
+typedef enum ReadyEvents {
+    READY_NONE = 0,
+    READY_TASK = 1 << 0,
+    READY_SERVER = 1 << 1,
+} ReadyEvents;
+
+// Wait until a task deadline or incoming connection is ready.
+bool wait_for_events(Runtime *rt, ReadyEvents *events) {
+    *events = READY_NONE;
+
+    int64_t next = tq_next_deadline(rt);
+
+    if (!isactive_server(rt)) {
+        if (next >= 0) sleep_until(next);
+        if (tq_has_due_task(rt)) *events |= READY_TASK;
+        return true;
+    }
+
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(rt->server.listen_fd, &read_fds);
+
+    struct timeval timeout;
+    struct timeval *timeout_ptr = NULL;
+    if (next >= 0) {
+        int64_t now = current_time_ms();
+        int64_t timeout_ms = next > now ? next - now : 0;
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (timeout_ms % 1000) * 1000;
+        timeout_ptr = &timeout;
+    }
+
+    int select_result = select(rt->server.listen_fd + 1, &read_fds, NULL, NULL, timeout_ptr);
+    if (select_result < 0) return false;
+
+    if (tq_has_due_task(rt)) *events |= READY_TASK;
+    if (select_result > 0 && FD_ISSET(rt->server.listen_fd, &read_fds)) *events |= READY_SERVER;
+    return true;
 }
 
 typedef struct HostClassSpec {
@@ -762,7 +748,7 @@ void install_classes(Runtime *rt) {
         {"Response", &rt->host_classes.response, response_constructor},
     };
 
-    size_t num_classes = sizeof(classes) / sizeof(classes[0]);
+    size_t num_classes = ARRAY_LEN(classes);
     for (size_t i = 0; i < num_classes; i++) {
         JSClassDefinition def = kJSClassDefinitionEmpty;
         def.className = classes[i].name;
@@ -781,7 +767,7 @@ void destroy_classes(Runtime *rt) {
         &rt->host_classes.response,
     };
 
-    size_t num_classes = sizeof(classes) / sizeof(classes[0]);
+    size_t num_classes = ARRAY_LEN(classes);
     for (size_t i = 0; i < num_classes; i++) {
         if (*classes[i]) {
             JSClassRelease(*classes[i]);
@@ -811,9 +797,8 @@ JSValueRef set_timeout_callback(JSContextRef ctx, JSObjectRef func, JSObjectRef 
     (void)thisObject;
     (void)exception;
 
-    if (argumentCount < 2 || !JSValueIsObject(ctx, arguments[0]) || !JSValueIsNumber(ctx, arguments[1])) {
+    if (argumentCount < 2 || !JSValueIsObject(ctx, arguments[0]) || !JSValueIsNumber(ctx, arguments[1]))
         return JSValueMakeNumber(ctx, -1);
-    }
 
     JSObjectRef callback = JSValueToObject(ctx, arguments[0], NULL);
     int delay_ms = (int)JSValueToNumber(ctx, arguments[1], NULL);
@@ -829,20 +814,20 @@ JSValueRef kobun_serve_callback(JSContextRef ctx, JSObjectRef func, JSObjectRef 
     (void)thisObject;
     (void)exception;
 
-    if (argumentCount < 1 || !JSValueIsObject(ctx, arguments[0])) { return JSValueMakeUndefined(ctx); }
+    if (argumentCount < 1 || !JSValueIsObject(ctx, arguments[0])) return JSValueMakeUndefined(ctx);
 
     JSObjectRef options = JSValueToObject(ctx, arguments[0], NULL);
     JSValueRef port_value = get_property(ctx, options, "port");
     JSValueRef fetch_value = get_property(ctx, options, "fetch");
 
-    if (!JSValueIsNumber(ctx, port_value) || !JSValueIsObject(ctx, fetch_value)) { return JSValueMakeUndefined(ctx); }
+    if (!JSValueIsNumber(ctx, port_value) || !JSValueIsObject(ctx, fetch_value)) return JSValueMakeUndefined(ctx);
 
     int port = (int)JSValueToNumber(ctx, port_value, NULL);
     JSObjectRef fetch = JSValueToObject(ctx, fetch_value, NULL);
-    if (port <= 0 || port > 65535 || !JSObjectIsFunction(ctx, fetch)) { return JSValueMakeUndefined(ctx); }
+    if (port <= 0 || port > 65535 || !JSObjectIsFunction(ctx, fetch)) return JSValueMakeUndefined(ctx);
 
     Runtime *rt = get_rt(ctx);
-    if (!start_server(rt, port, fetch)) { return JSValueMakeUndefined(ctx); }
+    if (!start_server(rt, port, fetch)) return JSValueMakeUndefined(ctx);
     return make_server_object(ctx, &rt->server);
 }
 
@@ -884,10 +869,9 @@ static struct {
 };
 
 void install_builtins(Runtime *rt) {
-    size_t num_builtins = sizeof(builtins) / sizeof(builtins[0]);
-    for (size_t i = 0; i < num_builtins; i++) {
+    size_t num_builtins = ARRAY_LEN(builtins);
+    for (size_t i = 0; i < num_builtins; i++)
         install_builtin(rt, builtins[i].object_name, builtins[i].function_name, builtins[i].callback);
-    }
 }
 
 // ==== interfaces ====
@@ -912,15 +896,20 @@ void destroy_rt(Runtime *rt) {
     destroy_classes(rt);
 }
 
+// clang-format off
 bool event_loop(Runtime *rt) {
-    while (!tq_is_empty(rt) || has_active_server(rt)) {
-        if (may_consume_task(rt) < 0) return false;
-        if (tq_is_empty(rt) && !has_active_server(rt)) return true;
-        if (!wait_for_events(rt)) return false;
+    while (!tq_is_empty(rt) || isactive_server(rt)) {
+        ReadyEvents events;
+        if (!wait_for_events(rt, &events)
+            || ((events & READY_TASK) && !may_consume_tasks(rt))
+            || ((events & READY_SERVER) && !handle_server_connection(rt))) {
+            return false;
+        }
     }
 
     return true;
 }
+// clang-format on
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
