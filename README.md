@@ -25,6 +25,8 @@ const server = Kobun.serve({
 console.log("listening", server.hostname, server.port);
 ```
 
+<img src="examples/result1.png" alt="result" width="100%">
+
 ## References
 
 WIP.
